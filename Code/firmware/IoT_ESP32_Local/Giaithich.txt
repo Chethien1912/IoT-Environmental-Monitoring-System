@@ -1,0 +1,347 @@
+1. Lúc ESP32 Bắt Đầu Chạy
+ESP32 boot
+  -> tạo object App
+  
+  
+  Controller app
+  -> gọi AppController::AppController()
+  -> vào setup()
+  -> app.begin()
+  -> app.startTasks()
+  -> các task bắt đầu chạy song song
+  2. Constructor Chạy Trước setup()
+  chạy AppController::AppController()
+  Khởi tạo:
+  _touchSPI
+  _touch
+  _ui
+  _co
+  _no2
+3. setup() Gọi begin()
+
+Trong begin():
+
+AppController::begin()
+  -> Serial.begin()
+  -> tạo mutex _stateMutex
+  -> lấy MAC WiFi
+  -> _wifi.begin()
+  -> _relay.begin()
+  -> _sht.begin()
+  -> cấu hình ADC
+  -> _co.begin()
+  -> _no2.begin()
+  -> _rtc.begin()
+  -> nếu RTC không hợp lệ thì set giờ mặc định
+  -> đọc RTC
+  -> cập nhật _state.dateText/timeText
+  -> refreshTimeEdit()
+  -> khởi động touch SPI
+  -> _touch.begin()
+  -> _touch.setRotation()
+  -> đưa state ban đầu vào UI
+  -> _ui.begin()
+Sau begin(), phần cứng và dữ liệu ban đầu đã sẵn sàng.
+
+4. setup() Gọi startTasks()
+xTaskCreatePinnedToCore(taskUI, ...)
+xTaskCreatePinnedToCore(taskControl, ...)
+xTaskCreatePinnedToCore(taskSensors, ...)
+xTaskCreatePinnedToCore(taskWifi, ...)
+Sau khi tạo, FreeRTOS scheduler sẽ cho các task chạy. Từ đây trở đi, chúng không chạy tuần tự cố định 1-2-3-4, mà chạy song song theo priority, core và delay.
+5. Task UI
+taskUI()
+  -> lấy AppController* self từ pv
+  -> lặp vô hạn:
+       self->runUI()
+       delay 20 ms
+runUI()
+  -> lấy mutex _stateMutex
+  -> copy _state vào _ui
+  -> copy _timeEdit vào _ui
+  -> copy _thresholdEdit vào _ui
+  -> nhả mutex
+  -> _ui.update()
+       -> DisplayUI đọc cảm ứng
+       -> DisplayUI vẽ màn hình
+       -> DisplayUI tạo pending event nếu có bấm
+  -> AppController::handleTouch()
+       -> lấy pending event từ _ui
+       -> xử lý relay/mode/wifi/time/threshold
+
+UI_INTERVAL_MS = 20 ms,Nhưng bên trong DisplayUI::update() có giới hạn vẽ khoảng 80 ms/lần.
+
+6. Task Control
+
+Task control được tạo từ:
+
+taskControl()
+Luồng:
+
+taskControl()
+  -> lấy AppController* self từ pv
+  -> lặp vô hạn:
+       self->runControl()
+       delay 80 ms
+Bên trong:
+
+runControl()
+  -> lấy mutex _stateMutex
+  -> nếu mode == Auto:
+       applyAutomation()
+         -> so sánh cảm biến với ngưỡng
+         -> bật/tắt relay 1, relay 2, relay 3
+  -> updateBuzzer()
+       -> nếu cảm biến nào vượt ngưỡng thì bật buzzer
+  -> syncStateFromRelay()
+       -> copy trạng thái relay thật vào _state
+  -> nhả mutex
+Task này lo phần điều khiển relay/buzzer.
+7. Task Sensors
+
+Task sensors được tạo từ:
+
+taskSensors()
+Luồng:
+
+taskSensors()
+  -> lấy AppController* self từ pv
+  -> lặp vô hạn:
+       self->runSensors()
+       delay 20 ms
+Bên trong runSensors() không đọc hết cảm biến mỗi 20 ms, mà kiểm tra đã đến thời điểm chưa:
+
+runSensors()
+  -> now = millis()
+
+  -> nếu đủ 1000 ms:
+       readRtc()
+         -> đọc DS3231
+         -> cập nhật _state.dateText/timeText
+         -> refreshTimeEdit nếu không đang mở màn cài giờ
+
+  -> nếu đủ 1500 ms:
+       readTempHumidity()
+         -> đọc SHT31
+         -> cập nhật _state.temperatureC/humidityPercent
+
+  -> nếu đủ 1500 ms:
+       readGasSensors()
+         -> đọc hoặc random CO/NO2
+         -> cập nhật _state.coPpm/no2Ppm
+
+  -> logSerial()
+       -> nếu đủ 3000 ms thì in log
+Task này cập nhật dữ liệu cảm biến vào _state
+
+8. Task WiFi
+
+Task WiFi được tạo từ:
+
+taskWifi()
+Luồng:
+
+taskWifi()
+  -> lấy AppController* self từ pv
+  -> lặp vô hạn:
+       self->runWifi()
+       delay 20 ms
+Bên trong:
+
+runWifi()
+  -> _wifi.handle()
+  -> _wifi.process()
+  -> syncRtcFromNtpIfNeeded()
+       -> nếu WiFi mới kết nối hoặc đến chu kỳ
+       -> sync giờ NTP vào RTC
+
+  -> lấy mutex
+  -> cập nhật _state.wifiConnected
+  -> nhả mutex
+
+  -> processBackendSync()
+       -> nếu có WiFi và có backend URL:
+            nếu runtime dirty:
+              pushRuntimeState()
+            nếu telemetry dirty hoặc đến chu kỳ:
+              pushTelemetry()
+            nếu đến chu kỳ poll:
+              pullBackendState()
+Task này lo WiFi, NTP và backend.
+
+9. Các Task Chạy Theo Priority/Core
+
+Các cấu hình:
+
+TASK_PRIORITY_UI      = 4
+TASK_PRIORITY_CONTROL = 2
+TASK_PRIORITY_SENSOR  = 1
+TASK_PRIORITY_WIFI    = 1
+UI có priority cao nhất.
+
+Core:
+
+TASK_CORE_UI      = 1
+TASK_CORE_CONTROL = 1
+TASK_CORE_SENSOR  = 0
+TASK_CORE_WIFI    = 0
+Nghĩa là:
+
+Core 1:
+  taskUI
+  taskControl
+
+Core 0:
+  taskSensors
+  taskWifi
+Nhưng thứ tự thực tế không cố định kiểu “UI xong rồi Control rồi Sensor”. FreeRTOS sẽ quyết định dựa trên:
+
+task nào đang delay
+task nào hết delay trước
+task nào priority cao hơn
+task nào đang chờ mutex
+task nào chạy trên core nào
+
+10. Luồng Dữ Liệu Chính
+
+Có thể hình dung dữ liệu đi như sau:
+
+Sensors task
+  -> đọc cảm biến
+  -> ghi vào _state
+
+Control task
+  -> đọc _state
+  -> điều khiển relay/buzzer
+  -> ghi trạng thái relay vào _state
+
+UI task
+  -> copy _state vào DisplayUI
+  -> vẽ màn hình
+  -> đọc cảm ứng
+  -> xử lý bấm nút và cập nhật relay/mode/time/threshold
+
+WiFi task
+  -> đọc _state
+  -> gửi backend
+  -> nhận lệnh backend
+  -> cập nhật _state/relay/threshold/RTC
+Tất cả cùng dùng _stateMutex để tránh sửa _state cùng lúc.
+11. Ví Dụ Một Chu Kỳ Người Dùng Bấm Relay
+
+Giả sử đang Manual, người dùng bấm relay 1:
+
+taskUI
+  -> runUI()
+  -> _ui.update()
+       -> DisplayUI::handleTouch()
+       -> phát hiện bấm vùng relay 1
+       -> _pendingRelay = 0
+
+  -> AppController::handleTouch()
+       -> _ui.consumeRelayToggle(relayIdx)
+       -> relayIdx = 0
+       -> _relay.setRelay1(!_relay.k1)
+       -> syncStateFromRelay()
+       -> _runtimeDirty = true
+       -> _telemetryDirty = true
+Sau đó:
+
+taskWifi
+  -> processBackendSync()
+  -> thấy _runtimeDirty = true
+  -> pushRuntimeState()
+  -> nếu gửi thành công: _runtimeDirty = false
+Và:
+
+taskUI
+  -> lần sau copy _state vào UI
+  -> UI vẽ lại relay 1 BAT/TAT
+
+  12. Ví Dụ Auto Điều Khiển Relay
+
+Giả sử cảm biến nhiệt độ đọc được 36°C, ngưỡng là 35°C:
+
+taskSensors
+  -> readTempHumidity()
+  -> _state.temperatureC = 36
+
+taskControl
+  -> runControl()
+  -> mode == Auto
+  -> applyAutomation()
+       -> 36 >= 35
+       -> _relay.setRelay1(true)
+  -> updateBuzzer()
+       -> alarm = true
+       -> _relay.setBuzzer(true)
+  -> syncStateFromRelay()
+       -> _state.relay1On = true
+       -> _state.buzzerOn = true
+
+taskUI
+  -> copy _state vào UI
+  -> vẽ relay 1 BAT và buzzer BAT
+Tóm gọn thứ tự ban đầu:
+
+AppController constructor
+  -> setup()
+  -> begin()
+  -> startTasks()
+  -> tạo taskUI/taskControl/taskSensors/taskWifi
+Sau đó các task chạy song song:
+
+taskUI      -> runUI()      mỗi ~20ms
+taskControl -> runControl() mỗi ~80ms
+taskSensors -> runSensors() mỗi ~20ms, nhưng đọc theo chu kỳ riêng
+taskWifi    -> runWifi()    mỗi ~20ms
+
+
+
+///---Giao thức mạng----///
+Một Số Mã HTTP Hay Gặp
+
+200 OK
+Server nhận và xử lý thành công.
+
+202 Accepted
+Server đã nhận, có thể xử lý sau.
+
+400 Bad Request
+JSON gửi lên sai hoặc thiếu dữ liệu.
+
+401 Unauthorized
+Thiếu xác thực.
+
+404 Not Found
+Sai đường dẫn API.
+
+500 Internal Server Error
+Backend bị lỗi.
+
+-1 hoặc số âm
+Thường là lỗi từ phía ESP32/thư viện, ví dụ không kết nối được server.
+
+//---Định dạng chuỗi gửi đi------//
+POST /api/telemetry HTTP/1.1
+Host: 192.168.1.10:3000
+Content-Type: application/json
+Content-Length: 320
+
+{"deviceMac":"AA:BB:CC:DD:EE:FF","temperatureC":30.50,"humidityPercent":65.20,"coPpm":1.02,"no2Ppm":0.003,"dateText":"22/04/2026","timeText":"14:30:05","relay1On":false,"relay2On":false,"relay3On":true,"buzzerOn":true,"wifiConnected":true,"controlMode":"auto","thresholds":{"temp":35.0,"humid":70.0,"co":50.0,"no2":15.00}}
+
+Giải thích: http:// là giao thức, 192.168.1.21 địa chỉ, 3000 là port
+
+chữ api(Application Programming Interface) ở đây chỉ là một đoạn path để người ta quy ước rằng “đây là route dành cho chương trình gọi vào”
+/api/telemetry
+/api/device-state
+/api/login
+/api/users
+các cụm sau api có nghĩa là phân luồng dữ liệu ra
+với telemetry nghĩa là dữ liệu đo từ xa
+///---cách hình dung dễ hiểu------//
+
+Server giống như một tòa nhà tiếp nhận yêu cầu:
+192.168.1.10:3000 = địa chỉ tòa nhà
+/api/device-local-control = quầy/phòng ban
+POST = kiểu công việc bạn muốn làm ở quầy đó
